@@ -11,6 +11,6 @@ scrape_configs:
     static_configs:
       - targets: ["kafka:9092"]
 
-  - job_name: "prefect-orion"
+  - job_name: "prefect-server"
     static_configs:
-      - targets: ["prefect-orion:4200"]
+      - targets: ["prefect-server:4200"]

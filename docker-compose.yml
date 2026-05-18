@@ -22,9 +22,9 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
 
   # ── Prefect ───────────────────────────────────────────────
-  prefect-orion:
+  prefect-server:
     image: prefecthq/prefect:2.14.0-python3.10
-    command: prefect orion start --host 0.0.0.0
+    command: prefect server start --host 0.0.0.0
     ports:
       - "4200:4200"
     volumes:
@@ -33,13 +33,14 @@ services:
   prefect-worker:
     image: prefecthq/prefect:2.14.0-python3.10
     command: prefect worker start -p docker -n lab28-worker
+    restart: on-failure
     environment:
-      PREFECT_API_URL: http://prefect-orion:4200/api
+      PREFECT_API_URL: http://prefect-server:4200/api
     volumes:
       - ./prefect/flows:/opt/prefect/flows
       - ./delta-lake:/opt/delta-lake
       - /var/run/docker.sock:/var/run/docker.sock
-    depends_on: [prefect-orion, kafka]
+    depends_on: [prefect-server, kafka]
 
   # ── Vector Store (Qdrant) ─────────────────────────────────
   qdrant:
@@ -77,9 +78,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      VLLM_URL: ${VLLM_NGROK_URL}
+      VLLM_URL: ${VLLM_URL:-http://host.docker.internal:8001}
+      EMBED_URL: ${EMBED_URL:-http://host.docker.internal:8002}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on: [qdrant, redis]
 
 volumes:

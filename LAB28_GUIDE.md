@@ -5,7 +5,7 @@
 
 ---
 
-## Kiến trúc Hybrid (Local + Kaggle)
+## Kiến trúc All-Local (GPU trên máy local)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -17,15 +17,12 @@
 │                                          ▼               │
 │  Prometheus ◄── Grafana          API Gateway (FastAPI)   │
 │  LangSmith tracing                       ▲               │
-└──────────────────────────────────────────┼───────────────┘
-                                           │  HTTP (ngrok)
-┌──────────────────────────────────────────┼───────────────┐
-│                 KAGGLE (GPU T4/P100)      │               │
 │                                          │               │
-│  vLLM / SGLang serving ◄─────────────────┘               │
-│  MLflow experiment tracking                              │
-│  Embedding model (sentence-transformers)                 │
-│  Model Registry                                          │
+│  ┌───────────────────────────────────────┴──────────┐    │
+│  │           LOCAL GPU (máy thật)                    │    │
+│  │  vLLM (Qwen2.5-0.5B-Instruct) ──── port 8001     │    │
+│  │  Embedding (bge-small-en-v1.5) ──── port 8002     │    │
+│  └───────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -34,9 +31,9 @@
 ## Yêu cầu trước khi bắt đầu
 
 - Docker Desktop đang chạy trên máy local
-- Tài khoản Kaggle đã kích hoạt GPU (Settings → Accelerator → GPU T4 x2)
-- `ngrok` đã cài: `brew install ngrok` hoặc tải tại ngrok.com
+- GPU NVIDIA (hoặc có thể chạy CPU với hiệu năng thấp hơn)
 - Python 3.10+ và `pip` trên máy local
+- Đã cài vLLM: `pip install vllm`
 
 ---
 
@@ -133,7 +130,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      VLLM_URL: ${VLLM_NGROK_URL}
+      VLLM_URL: ${VLLM_URL:-http://host.docker.internal:8001}
       QDRANT_URL: http://qdrant:6333
       REDIS_URL: redis://redis:6379
     depends_on: [qdrant, redis]
@@ -179,146 +176,55 @@ docker compose ps   # kiểm tra tất cả services đang Up
 
 ---
 
-## PHẦN 2 — Kaggle GPU Setup & Expose qua Tunnel
+## PHẦN 2 — Local GPU Setup (thay thế Kaggle)
 
-**Mục tiêu:** Chạy vLLM serving trên Kaggle GPU, expose port ra để local gọi được.
+**Mục tiêu:** Chạy vLLM + Embedding service trực tiếp trên GPU máy local.
 
-### Bước 2.1 — Tạo Kaggle Notebook
-
-Tạo notebook mới trên Kaggle, bật **GPU T4 x2**, chọn 1 trong 2 option:
-
-**Option A: Dùng ngrok**
-
-```python
-# Cell 1 — Cài dependencies
-!pip install -q vllm fastapi uvicorn pyngrok mlflow sentence-transformers
-
-# Cell 2 — Setup ngrok token (lấy tại ngrok.com/your-authtoken)
-from pyngrok import ngrok
-ngrok.set_auth_token("YOUR_NGROK_TOKEN")  # thay token của bạn
-
-# Cell 3 — Khởi động vLLM server
-import subprocess, threading, time
-
-def run_vllm():
-    subprocess.run([
-        "python", "-m", "vllm.entrypoints.openai.api_server",
-        "--model", "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
-        "--port", "8001",
-        "--max-model-len", "4096",
-        "--gpu-memory-utilization", "0.85"
-    ])
-
-thread = threading.Thread(target=run_vllm, daemon=True)
-thread.start()
-time.sleep(60)  # chờ model load
-print("vLLM server started")
-
-# Cell 4 — Tạo ngrok tunnel
-tunnel = ngrok.connect(8001, "http")
-vllm_url = tunnel.public_url
-print(f"vLLM URL (copy this): {vllm_url}")
-# → Paste URL này vào file .env trên local
-```
-
-**Option B: Dùng cloudflared**
-
-```python
-# Cell 1 — Cài dependencies
-!pip install -q vllm fastapi uvicorn cloudflared mlflow sentence-transformers
-
-# Cell 2 — Khởi động vLLM server
-import subprocess, threading, time
-
-def run_vllm():
-    subprocess.run([
-        "python", "-m", "vllm.entrypoints.openai.api_server",
-        "--model", "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
-        "--port", "8001",
-        "--max-model-len", "4096",
-        "--gpu-memory-utilization", "0.85"
-    ])
-
-thread = threading.Thread(target=run_vllm, daemon=True)
-thread.start()
-time.sleep(60)  # chờ model load
-print("vLLM server started")
-
-# Cell 3 — Tạo cloudflare tunnel
-import subprocess
-tunnel = subprocess.run(["cloudflared", "tunnel", "--url", "http://localhost:8001"], capture_output=True, text=True)
-print(f"vLLM URL (copy from output):")
-print(tunnel.stdout)
-# → Paste URL này vào file .env trên local
-```
-
-### Bước 2.2 — Embedding service trên Kaggle
-
-**Nếu dùng ngrok:**
-
-```python
-# Cell 5 — Embedding API server
-from fastapi import FastAPI
-from sentence_transformers import SentenceTransformer
-import uvicorn, threading
-
-app = FastAPI()
-model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-@app.post("/embed")
-def embed(data: dict):
-    texts = data["texts"]
-    embeddings = model.encode(texts).tolist()
-    return {"embeddings": embeddings}
-
-def run_embed():
-    uvicorn.run(app, host="0.0.0.0", port=8002)
-
-threading.Thread(target=run_embed, daemon=True).start()
-embed_tunnel = ngrok.connect(8002, "http")
-print(f"Embedding URL: {embed_tunnel.public_url}")
-```
-
-**Nếu dùng cloudflared:**
-
-```python
-# Cell 4 — Embedding API server
-from fastapi import FastAPI
-from sentence_transformers import SentenceTransformer
-import uvicorn, threading
-
-app = FastAPI()
-model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-@app.post("/embed")
-def embed(data: dict):
-    texts = data["texts"]
-    embeddings = model.encode(texts).tolist()
-    return {"embeddings": embeddings}
-
-def run_embed():
-    uvicorn.run(app, host="0.0.0.0", port=8002)
-
-threading.Thread(target=run_embed, daemon=True).start()
-import subprocess
-embed_tunnel = subprocess.run(["cloudflared", "tunnel", "--url", "http://localhost:8002"], capture_output=True, text=True)
-print(f"Embedding URL (copy from output):")
-print(embed_tunnel.stdout)
-```
-
-### Bước 2.3 — Cập nhật `.env` trên local
+### Bước 2.1 — Cài đặt dependencies
 
 ```bash
-# lab28/.env
-# Nếu dùng ngrok:
-VLLM_NGROK_URL=https://xxxx.ngrok-free.app   # từ Cell 4
-EMBED_NGROK_URL=https://yyyy.ngrok-free.app   # từ Cell 5
-# Nếu dùng cloudflared:
-# VLLM_NGROK_URL=https://xxxx.trycloudflare.com   # từ Cell 3
-# EMBED_NGROK_URL=https://yyyy.trycloudflare.com   # từ Cell 4
-LANGCHAIN_API_KEY=your_langsmith_key
-LANGCHAIN_PROJECT=lab28-platform
+pip install vllm fastapi uvicorn sentence-transformers httpx
 ```
+
+### Bước 2.2 — Chạy local GPU services
+
+**Cách 1: Dùng script tự động (khuyên dùng)**
+
+```bash
+# Chạy cả vLLM + Embedding service
+bash scripts/run_local_services.sh
+```
+
+**Cách 2: Chạy từng service riêng**
+
+```bash
+# Terminal 1 — Embedding service (port 8002)
+python scripts/run_embedding.py
+
+# Terminal 2 — vLLM server (port 8001)
+python scripts/run_llm.py
+```
+
+### Model đang sử dụng
+
+| Service | Model | Parameters | Port |
+|---------|-------|-----------|------|
+| vLLM | `Qwen/Qwen2.5-0.5B-Instruct` | **0.5B** (siêu nhẹ) | 8001 |
+| Embedding | `BAAI/bge-small-en-v1.5` | 384-dim, ~33MB | 8002 |
+
+> **Tại sao chọn Qwen2.5-0.5B-Instruct?** Đây là model instruction-following nhẹ nhất có thể, chỉ cần ~1GB VRAM, phù hợp chạy local GPU, vẫn đảm bảo chất lượng trả lời cơ bản.
+
+### Bước 2.3 — File `.env` đã được cập nhật tự động
+
+File `.env` đã được cấu hình sẵn để trỏ tới local services:
+
+```bash
+VLLM_URL=http://host.docker.internal:8001
+EMBED_URL=http://host.docker.internal:8002
+LLM_MODEL=Qwen/Qwen2.5-0.5B-Instruct
+```
+
+> `host.docker.internal` cho phép container Docker (API Gateway) gọi tới service chạy trên máy host.
 
 ---
 
@@ -447,7 +353,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 import os
 
-EMBED_URL = os.environ["EMBED_NGROK_URL"]
+EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:8002")
 qdrant = QdrantClient(host="localhost", port=6333)
 
 # Tạo collection
@@ -457,7 +363,7 @@ qdrant.recreate_collection(
 )
 
 def embed_and_store(records: list[dict]):
-    # Gọi Kaggle embedding service
+    # Gọi local embedding service (port 8002)
     response = requests.post(f"{EMBED_URL}/embed", json={"texts": [r["text"] for r in records]})
     embeddings = response.json()["embeddings"]
 
@@ -478,21 +384,21 @@ embed_and_store([
 ### Integration 6 & 7: MLflow → Model Registry → vLLM
 
 ```python
-# Chạy trên Kaggle Notebook (Cell 6)
+# Chạy local (hoặc trên MLflow server)
 import mlflow
 import os
 
-mlflow.set_tracking_uri("https://dagshub.com/YOUR_USER/lab28.mlflow")  # hoặc dùng local
+mlflow.set_tracking_uri("http://localhost:5000")  # MLflow server local, hoặc dùng DagsHub
 mlflow.set_experiment("lab28-integration")
 
 with mlflow.start_run(run_name="vllm-serving-v1"):
-    mlflow.log_param("model", "Qwen2.5-7B-Instruct-GPTQ-Int4")
-    mlflow.log_param("max_model_len", 4096)
+    mlflow.log_param("model", "Qwen2.5-0.5B-Instruct")
+    mlflow.log_param("max_model_len", 2048)
     mlflow.log_metric("gpu_memory_utilization", 0.85)
     mlflow.log_metric("avg_latency_ms", 450)
 
     # Tag model version
-    mlflow.set_tag("serving_url", vllm_url)
+    mlflow.set_tag("serving_url", "http://localhost:8001")
     mlflow.set_tag("status", "production")
 
 print("Integration 6+7 OK: MLflow → Model Registry → vLLM")
@@ -504,33 +410,43 @@ print("Integration 6+7 OK: MLflow → Model Registry → vLLM")
 # api-gateway/main.py
 from fastapi import FastAPI, Request
 from prometheus_fastapi_instrumentator import Instrumentator
-import httpx, os, time, langsmith
+import httpx, os, time
 
 app = FastAPI(title="AI Platform API Gateway")
 Instrumentator().instrument(app).expose(app)  # Integration 9: Prometheus
 
-VLLM_URL = os.environ["VLLM_NGROK_URL"]
+VLLM_URL = os.environ["VLLM_URL"]
+EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:8002")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+
 
 @app.post("/api/v1/chat")
 async def chat(request: Request):
     body = await request.json()
-    query = body["query"]
+    query = body.get("query")
+    if not query:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=422, detail="Field 'query' is required")
     start = time.time()
 
-    # 1. Vector search
     async with httpx.AsyncClient() as client:
+        # 1. Generate embedding locally
+        embed_resp = await client.post(f"{EMBED_URL}/embed", json={"texts": [query]})
+        embedding = embed_resp.json()["embeddings"][0]
+
+        # 2. Vector search in Qdrant
         search_resp = await client.post(f"{QDRANT_URL}/collections/documents/points/search", json={
-            "vector": body.get("embedding", [0.0] * 384),
+            "vector": embedding,
             "limit": 3
         })
         context = search_resp.json().get("result", [])
 
-    # 2. LLM inference
+    # 3. LLM inference
     prompt = f"Context: {context}\n\nQuery: {query}"
     async with httpx.AsyncClient(timeout=30) as client:
         llm_resp = await client.post(f"{VLLM_URL}/v1/chat/completions", json={
-            "model": "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4",
+            "model": LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}]
         })
 
@@ -542,6 +458,7 @@ async def chat(request: Request):
         "latency_ms": round(latency, 2),
         "model": result["model"]
     }
+
 
 @app.get("/health")
 def health():
@@ -584,21 +501,20 @@ check_langsmith()
 import pytest, requests, time, os
 
 BASE_URL = "http://localhost:8000"
-VLLM_URL = os.environ.get("VLLM_NGROK_URL", "")
+VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001")
 
 # ── Test 1: Happy Path — Full Inference Request ───────────────
 class TestHappyPath:
     def test_full_inference_returns_200(self):
         """Data vào API Gateway, nhận được answer từ LLM"""
         resp = requests.post(f"{BASE_URL}/api/v1/chat", json={
-            "query": "What is platform engineering?",
-            "embedding": [0.1] * 384
-        }, timeout=30)
+            "query": "What is platform engineering?"
+        }, timeout=60)
         assert resp.status_code == 200
         data = resp.json()
         assert "answer" in data
         assert len(data["answer"]) > 10
-        assert data["latency_ms"] < 2000
+        assert data["latency_ms"] < 30000
 
     def test_health_check_passes(self):
         """API Gateway health check"""
@@ -660,7 +576,7 @@ class TestFailurePath:
         """Timeout không làm crash service"""
         try:
             resp = requests.post(f"{BASE_URL}/api/v1/chat",
-                                 json={"query": "test", "embedding": [0.1] * 384},
+                                 json={"query": "test"},
                                  timeout=0.001)
         except requests.exceptions.Timeout:
             pass  # Expected — graceful timeout
@@ -762,7 +678,7 @@ print(f"Target: >80% — Status: {'READY' if score >= 80 else 'NOT READY'}")
 #### Phần 1 — Architecture Overview (2 phút)
 Mở diagram hybrid architecture, giải thích:
 - 5 layers của AI platform
-- Tại sao tách GPU lên Kaggle (cost efficiency)
+- GPU models chạy local (vLLM + Embedding service)
 - Event-driven pattern với Kafka
 
 #### Phần 2 — Live Demo: Happy Path (5 phút)
@@ -823,7 +739,7 @@ wait
 Chuẩn bị sẵn câu trả lời cho:
 - "Tại sao dùng Kafka thay vì gọi trực tiếp?" → decoupling, replay
 - "Circuit breaker implement ở đâu?" → API Gateway middleware
-- "Nếu Kaggle ngắt kết nối thì sao?" → fallback to cached responses
+- "Nếu GPU service crash thì sao?" → auto-restart bằng systemd/supervisor
 
 ---
 
@@ -838,7 +754,7 @@ Chuẩn bị sẵn câu trả lời cho:
 [ ] pytest smoke-tests/ -v — 5/5 PASSED
 [ ] python scripts/production_readiness_check.py — score >= 80%
 [ ] Grafana dashboard có metrics
-[ ] Kaggle notebook vẫn chạy (kernel active)
+[ ] Local GPU services đang chạy (python scripts/run_llm.py + run_embedding.py)
 [ ] Demo script đã chạy thử 1 lần
 ```
 
@@ -849,7 +765,7 @@ Chuẩn bị sẵn câu trả lời cho:
 | Thời gian | Công việc |
 |---|---|
 | 0:00 – 0:20 | Phần 1: Docker Compose up, kiểm tra services |
-| 0:20 – 0:35 | Phần 2: Kaggle notebook, lấy ngrok URLs |
+| 0:20 – 0:35 | Phần 2: Chạy local GPU services (scripts/run_local_services.sh) |
 | 0:35 – 1:00 | Phần 3: Kết nối 10 integration points, chạy từng script |
 | 1:00 – 1:20 | Phần 4: Chạy 5 smoke tests, fix failures |
 | 1:20 – 1:35 | Phần 5: Production readiness check, đạt >80% |

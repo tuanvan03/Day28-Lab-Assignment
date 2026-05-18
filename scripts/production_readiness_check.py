@@ -49,8 +49,15 @@ check("Redis reachable", lambda:
 
 print("\n=== KAFKA ===")
 def check_kafka_topics():
+    # Tìm container Kafka đang chạy
     result = subprocess.run(
-        ["docker", "exec", "lab28-kafka-1", "kafka-topics", "--list",
+        ["docker", "ps", "--filter", "ancestor=confluentinc/cp-kafka", "--format", "{{.Names}}"],
+        capture_output=True, text=True
+    )
+    containers = result.stdout.strip().split("\n")
+    container = containers[0] if containers[0] else "lab28-kafka-1"
+    result = subprocess.run(
+        ["docker", "exec", container, "kafka-topics", "--list",
          "--bootstrap-server", "localhost:9092"],
         capture_output=True, text=True
     )
